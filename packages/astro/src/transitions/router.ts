@@ -3,7 +3,7 @@ import type { TransitionBeforePreparationEvent } from './events.js';
 
 import { doPreparation, doSwap, onPageLoad, triggerEvent, updateScrollPosition } from './events.js';
 import { detectScriptExecuted } from './swap-functions.js';
-import type { Direction, Fallback, Options } from './types.js';
+import type { Direction, Fallback, NavigationTypeString, Options } from './types.js';
 
 type State = {
 	index: number;
@@ -11,6 +11,30 @@ type State = {
 	scrollY: number;
 };
 type Navigation = { controller: AbortController };
+type FetchedHTML = { html: string; redirected?: string; mediaType: DOMParserSupportedType };
+type NavigationApi = {
+	addEventListener: (type: 'navigate', listener: (event: NavigateEvent) => void) => void;
+	currentEntry: { index: number; key: string; url: string } | null;
+	navigate: (url: string, options?: { history?: Options['history']; info?: Options }) => unknown;
+};
+type NavigateEvent = {
+	canIntercept: boolean;
+	destination: { index: number; key: string; url: string };
+	formData?: FormData;
+	hasUAVisualTransition?: boolean;
+	hashChange: boolean;
+	info?: Options;
+	navigationType: 'push' | 'replace' | 'reload' | 'traverse';
+	signal: AbortSignal;
+	sourceElement?: Element;
+	intercept: (options: {
+		focusReset: 'manual';
+		handler: () => Promise<void>;
+		precommitHandler?: () => Promise<void>;
+		scroll: 'manual';
+	}) => void;
+	scroll: () => void;
+};
 type Transition = {
 	// The view transitions object (API and simulation)
 	viewTransition?: ViewTransition;
@@ -21,8 +45,12 @@ type Transition = {
 };
 
 const inBrowser = import.meta.env.SSR === false;
+const navigationApi = inBrowser
+	? (window as Window & { navigation?: NavigationApi }).navigation
+	: undefined;
 
 export const supportsViewTransitions = inBrowser && !!document.startViewTransition;
+export const supportsNavigationApi = !!navigationApi;
 
 export const transitionEnabledOnThisPage = () =>
 	inBrowser && !!document.querySelector('[name="astro-view-transitions-enabled"]');
@@ -68,8 +96,11 @@ let parser: DOMParser;
 // you can figure it using an index. On pushState the index is incremented so you
 // can use that to determine popstate if going forward or back.
 let currentHistoryIndex = 0;
+let bypassNavigationApi = false;
+const navigationScrollPositions = new Map<string, { scrollX: number; scrollY: number }>();
+let navigationInProgress: NavigateEvent | undefined;
 
-if (inBrowser) {
+if (inBrowser && !supportsNavigationApi) {
 	if (history.state) {
 		// Here we reloaded a page with history state
 		// (e.g. history navigation from non-transition page or browser reload)
@@ -87,7 +118,7 @@ if (inBrowser) {
 async function fetchHTML(
 	href: string,
 	init?: RequestInit,
-): Promise<null | { html: string; redirected?: string; mediaType: DOMParserSupportedType }> {
+): Promise<null | FetchedHTML> {
 	try {
 		// Apply adapter-specific headers for internal fetches
 		const headers = new Headers(init?.headers);
@@ -271,6 +302,7 @@ async function updateDOM(
 	currentTransition: Transition,
 	historyState?: State,
 	fallback?: Fallback,
+	navigationEvent?: NavigateEvent,
 ) {
 	async function animate(phase: string) {
 		function isInfinite(animation: Animation) {
@@ -312,7 +344,21 @@ async function updateDOM(
 		currentTransition.viewTransition!,
 		animateFallbackOld,
 	);
-	moveToLocation(swapEvent.to, swapEvent.from, options, pageTitleForBrowserHistory, historyState);
+	if (navigationEvent) {
+		originalLocation = swapEvent.to;
+		if (navigationEvent.navigationType === 'traverse') {
+			const scrollPosition = navigationScrollPositions.get(navigationEvent.destination.key);
+			if (scrollPosition) {
+				scrollTo(scrollPosition.scrollX, scrollPosition.scrollY);
+			} else {
+				navigationEvent.scroll();
+			}
+		} else {
+			navigationEvent.scroll();
+		}
+	} else {
+		moveToLocation(swapEvent.to, swapEvent.from, options, pageTitleForBrowserHistory, historyState);
+	}
 	triggerEvent('astro:after-swap');
 
 	// Resolve the finished promise of the simulation's ViewTransition.
@@ -339,6 +385,9 @@ async function transition(
 	options: Options,
 	historyState?: State,
 	hasUAVisualTransition = false,
+	navigationTypeOverride?: NavigationTypeString,
+	navigationEvent?: NavigateEvent,
+	preloadedResponse?: FetchedHTML,
 ) {
 	// The most recent navigation always has precedence
 	// Yes, there can be several navigation instances as the user can click links
@@ -347,21 +396,23 @@ async function transition(
 	// Invariant: all but the most recent navigation are already aborted.
 
 	const currentNavigation = abortAndRecreateMostRecentNavigation();
+	navigationEvent?.signal.addEventListener('abort', () => currentNavigation.controller.abort(), {
+		once: true,
+	});
 
 	// not ours
 	if (!transitionEnabledOnThisPage() || location.origin !== to.origin) {
 		if (currentNavigation === mostRecentNavigation) mostRecentNavigation = undefined;
+		if (navigationEvent) bypassNavigationApi = true;
 		location.href = to.href;
 		return;
 	}
 
-	const navigationType = historyState
-		? 'traverse'
-		: options.history === 'replace'
-			? 'replace'
-			: 'push';
+	const navigationType =
+		navigationTypeOverride ??
+		(historyState ? 'traverse' : options.history === 'replace' ? 'replace' : 'push');
 
-	if (navigationType !== 'traverse') {
+	if (!navigationEvent && navigationType !== 'traverse') {
 		updateScrollPosition({ scrollX, scrollY });
 	}
 	if (samePage(from, to) && !options.formData) {
@@ -382,11 +433,13 @@ async function transition(
 		currentNavigation!.controller.signal,
 		options.formData,
 		defaultLoader,
+		!navigationEvent,
 	);
 	if (prepEvent.defaultPrevented || prepEvent.signal.aborted) {
 		if (currentNavigation === mostRecentNavigation) mostRecentNavigation = undefined;
 		if (!prepEvent.signal.aborted) {
 			// not aborted -> delegate to browser
+			if (navigationEvent) bypassNavigationApi = true;
 			location.href = to.href;
 		}
 		// and / or exit
@@ -420,7 +473,8 @@ async function transition(
 					? new URLSearchParams(preparationEvent.formData as any)
 					: preparationEvent.formData;
 		}
-		const response = await fetchHTML(href, init);
+		const response = preloadedResponse ?? (await fetchHTML(href, init));
+		preloadedResponse = undefined;
 		// If there is a problem fetching the new page, just do an MPA navigation to it.
 		if (response === null) {
 			preparationEvent.preventDefault();
@@ -503,7 +557,15 @@ async function transition(
 		// This automatically cancels any previous transition
 		// We also already took care that the earlier update callback got through
 		currentTransition.viewTransition = document.startViewTransition(
-			async () => await updateDOM(prepEvent, options, currentTransition, historyState),
+			async () =>
+				await updateDOM(
+					prepEvent,
+					options,
+					currentTransition,
+					historyState,
+					undefined,
+					navigationEvent,
+				),
 		);
 	} else {
 		// Simulation mode requires a bit more manual work.
@@ -519,6 +581,7 @@ async function transition(
 				currentTransition,
 				historyState,
 				hasUAVisualTransition ? 'swap' : getFallback(),
+				navigationEvent,
 			);
 			return undefined;
 		})();
@@ -594,10 +657,100 @@ export async function navigate(href: string, options?: Options) {
 		}
 		return;
 	}
+	if (navigationApi) {
+		navigationApi.navigate(new URL(href, location.href).href, {
+			history: options?.history ?? 'auto',
+			info: options ?? {},
+		});
+		return;
+	}
 	await transition('forward', originalLocation, new URL(href, location.href), options ?? {});
 }
 
+function onNavigate(event: NavigateEvent) {
+	if (bypassNavigationApi) {
+		bypassNavigationApi = false;
+		return;
+	}
+	const navigationType = event.navigationType;
+	const options = (event.info as Options | undefined) ?? {};
+	const formData = event.formData ?? options.formData;
+	const currentEntry = navigationApi?.currentEntry;
+	const from = new URL(currentEntry?.url ?? location.href);
+	const to = new URL(event.destination.url);
+	const direction: Direction =
+		navigationType === 'traverse' && event.destination.index < (currentEntry?.index ?? 0)
+			? 'back'
+			: 'forward';
+	const browserHandlesHashChange =
+		!formData &&
+		event.hashChange &&
+		((direction !== 'back' && !!to.hash) || (direction === 'back' && !!from.hash));
+
+	if (
+		((navigationType === 'push' || navigationType === 'replace') && event.info === undefined) ||
+		!event.canIntercept ||
+		browserHandlesHashChange ||
+		location.origin !== to.origin ||
+		navigationType === 'reload'
+	) {
+		return;
+	}
+
+	let preloadedResponse: FetchedHTML | undefined;
+	event.intercept({
+		focusReset: 'manual',
+		precommitHandler:
+			(navigationType === 'push' || navigationType === 'replace') && !formData
+				? async () => {
+					const response = await fetchHTML(to.href, { signal: event.signal });
+					if (response) {
+						parser ??= new DOMParser();
+						const nextDocument = parser.parseFromString(response.html, response.mediaType);
+						if (nextDocument.querySelector('[name="astro-view-transitions-enabled"]')) {
+							preloadedResponse = response;
+							return;
+						}
+					}
+					bypassNavigationApi = true;
+					location.href = to.href;
+					throw new DOMException('Delegating navigation to the browser', 'AbortError');
+				}
+				: undefined,
+		scroll: 'manual',
+		handler: async () => {
+			navigationInProgress = event;
+			try {
+				await transition(
+					direction,
+					from,
+					to,
+					{
+						...options,
+						sourceElement: event.sourceElement ?? options.sourceElement,
+						formData: event.formData ?? options.formData,
+					},
+					undefined,
+					event.hasUAVisualTransition ?? false,
+					navigationType,
+					event,
+					preloadedResponse,
+				);
+			} finally {
+				if (navigationInProgress === event) navigationInProgress = undefined;
+			}
+		},
+	});
+}
+
+function onNavigationScroll() {
+	if (navigationInProgress) return;
+	const entry = navigationApi?.currentEntry;
+	if (entry) navigationScrollPositions.set(entry.key, { scrollX, scrollY });
+}
+
 function onPopState(ev: PopStateEvent) {
+	if (supportsNavigationApi) return;
 	if (!transitionEnabledOnThisPage() && ev.state) {
 		// The current page doesn't have View Transitions enabled
 		// but the page we navigate to does (because it set the state).
@@ -642,12 +795,14 @@ const onScrollEnd = () => {
 if (inBrowser) {
 	if (supportsViewTransitions || getFallback() !== 'none') {
 		originalLocation = new URL(location.href);
-		addEventListener('popstate', onPopState);
+		if (navigationApi) navigationApi.addEventListener('navigate', onNavigate);
+		else addEventListener('popstate', onPopState);
 		addEventListener('load', onPageLoad);
+		if (navigationApi) addEventListener('scroll', onNavigationScroll, { passive: true });
 		// There's not a good way to record scroll position before a history back
 		// navigation, so we will record it when the user has stopped scrolling.
-		if ('onscrollend' in window) addEventListener('scrollend', onScrollEnd);
-		else {
+		if (!navigationApi && 'onscrollend' in window) addEventListener('scrollend', onScrollEnd);
+		else if (!navigationApi) {
 			// Keep track of state between intervals
 			let intervalId: number | undefined, lastY: number, lastX: number, lastIndex: State['index'];
 			const scrollInterval = () => {
