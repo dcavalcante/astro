@@ -24,6 +24,10 @@ jobs:
       - run: pnpm install
       - name: Build
         run: pnpm run build
+      - name: External Navigation API interop probe
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/navigation-api-interop-review.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0
       - name: Focused navigation regressions
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
@@ -51,4 +55,4 @@ jobs:
         run: |
           pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts
           pnpm run typecheck
-          git diff --check dbbf10e606f64b4ba2b8362868b6a27a9a937eb8 HEAD~2 -- packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/fixtures/view-transitions/src/pages/one.astro .changeset/sharp-words-share.md
+          git diff --check dbbf10e606f64b4ba2b8362868b6a27a9a937eb8 HEAD~3 -- packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/fixtures/view-transitions/src/pages/one.astro .changeset/sharp-words-share.md
