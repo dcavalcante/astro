@@ -1,4 +1,4 @@
-name: Navigation API review v4
+name: Navigation API review v5
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   review:
-    if: github.event.head_commit.message == 'review navigation api v4'
+    if: github.event.head_commit.message == 'review navigation api v5'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -23,6 +23,20 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install
+
+      - name: Baseline framework-router control
+        shell: bash
+        run: |
+          git reset --hard de5cc2d54e92d8746959e39fee1a8f0b4ddfe4bf
+          pnpm run build
+          set +e
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts \
+            --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=5 \
+            --grep="Use the client side router in framework components"
+          status=$?
+          set -e
+          echo "Baseline raw framework-router stress exit code: $status"
+          git reset --hard "$GITHUB_SHA"
 
       - name: Recreate candidate and apply fixes
         shell: bash
@@ -132,21 +146,34 @@ jobs:
           \t\t\tnavigationApi.addEventListener('currententrychange', onNavigationCurrentEntryChange);"""
           assert old_init_listener in router
           router = router.replace(old_init_listener, new_init_listener, 1)
-
           path.write_text(router)
+
+          test_path = Path('packages/astro/e2e/view-transitions.test.ts')
+          tests = test_path.read_text()
+          old_click = """\t\tawait expect(button, 'should have content').toHaveText('Navigate to `/two`');
+          \t\tawait button.click();"""
+          new_click = """\t\tawait expect(button, 'should have content').toHaveText('Navigate to `/two`');
+          \t\tawait expect(
+          \t\t\tpage.locator('astro-island:not([ssr]) #react-client-load-navigate-button'),
+          \t\t\t'should be hydrated',
+          \t\t).toHaveCount(1);
+          \t\tawait button.click();"""
+          assert old_click in tests
+          tests = tests.replace(old_click, new_click, 1)
+          test_path.write_text(tests)
           PY
           git diff --check
 
-      - name: Build
+      - name: Build candidate
         run: pnpm run build
 
-      - name: Focused traversal regressions
+      - name: Focused regressions
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0
-          --grep="Back button is captured|cross-route fragments|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts"
+          --grep="Back button is captured|cross-route fragments|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts|Use the client side router in framework components"
 
-      - name: Framework router stress
+      - name: Hydrated framework router stress
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=20
