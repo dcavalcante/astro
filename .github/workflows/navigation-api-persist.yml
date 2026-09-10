@@ -1,0 +1,74 @@
+name: Persist Navigation API candidate
+
+on:
+  push:
+    branches:
+      - review/navigation-api-client-router-persist
+
+permissions:
+  contents: write
+
+jobs:
+  persist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - name: Apply validated ownership fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('packages/astro/src/transitions/router.ts')
+          text = path.read_text()
+          replacements = [
+              (
+                  "type NavigationHistoryEntry = {\n\taddEventListener:",
+                  "type NavigationHistoryEntry = {\n\tid: string;\n\taddEventListener:",
+              ),
+              (
+                  "\tdestination: { index: number; key: string; sameDocument: boolean; url: string };",
+                  "\tdestination: { id: string; index: number; key: string; sameDocument: boolean; url: string };",
+              ),
+              (
+                  "const navigationEntries = new Map<string, NavigationHistoryEntry>();\nconst astroNavigationRequests",
+                  "const navigationEntries = new Map<string, NavigationHistoryEntry>();\nlet pendingManagedHashEntry = false;\nconst astroNavigationRequests",
+              ),
+              (
+                  "\tif (!entry || navigationEntries.get(entry.key) === entry) return;\n\tnavigationEntries.set(entry.key, entry);",
+                  "\tif (!entry || navigationEntries.get(entry.id) === entry) return;\n\tnavigationEntries.set(entry.id, entry);",
+              ),
+              (
+                  "\t\t\tif (navigationEntries.get(entry.key) !== entry) return;\n\t\t\tnavigationEntries.delete(entry.key);",
+                  "\t\t\tif (navigationEntries.get(entry.id) !== entry) return;\n\t\t\tnavigationEntries.delete(entry.id);",
+              ),
+              (
+                  "\tif (entry && navigationEntries.has(entry.key)) {",
+                  "\tif (entry && navigationEntries.has(entry.id)) {",
+              ),
+              (
+                  "function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {\n\tconst currentEntry = navigationApi?.currentEntry;\n\tif (\n\t\tcurrentEntry &&\n\t\t!navigationEntries.has(currentEntry.key) &&\n\t\tnavigationEntries.has(event.from.key) &&\n\t\tcurrentEntry.sameDocument\n\t) {\n\t\ttrackNavigationEntry(currentEntry);\n\t}\n}",
+                  "function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {\n\tconst currentEntry = navigationApi?.currentEntry;\n\tif (\n\t\tpendingManagedHashEntry &&\n\t\tcurrentEntry?.sameDocument &&\n\t\tnavigationEntries.has(event.from.id)\n\t) {\n\t\ttrackNavigationEntry(currentEntry);\n\t}\n\tpendingManagedHashEntry = false;\n}",
+              ),
+              (
+                  "\t\t(!!currentEntry &&\n\t\t\tnavigationEntries.has(currentEntry.key) &&\n\t\t\tnavigationEntries.has(event.destination.key));\n\n\tsaveNavigationScrollPosition();",
+                  "\t\t(!!currentEntry &&\n\t\t\tnavigationEntries.has(currentEntry.id) &&\n\t\t\tnavigationEntries.has(event.destination.id));\n\n\tpendingManagedHashEntry =\n\t\tbrowserHandlesHashChange &&\n\t\tisAstroNavigation &&\n\t\t!!currentEntry &&\n\t\tnavigationEntries.has(currentEntry.id);\n\tsaveNavigationScrollPosition();",
+              ),
+          ]
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, got {count}: {old[:100]!r}')
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+          git mv packages/astro/e2e/navigation-api-interop-review.test.ts packages/astro/e2e/navigation-api-interop.test.ts
+      - name: Persist candidate blobs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/astro/src/transitions/router.ts packages/astro/e2e/navigation-api-interop.test.ts
+          git commit -m "chore: persist validated Navigation API candidate"
+          git push origin HEAD:refs/heads/review/navigation-api-client-router-promoted --force
