@@ -1,4 +1,4 @@
-name: Navigation API review v3
+name: Navigation API review v4
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   review:
-    if: github.event.head_commit.message == 'review navigation api v3'
+    if: github.event.head_commit.message == 'review navigation api v4'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -47,6 +47,7 @@ jobs:
 
           path = Path('packages/astro/src/transitions/router.ts')
           router = path.read_text()
+
           old_state = "\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });"
           new_state = "\t\t\tif (options.state !== undefined) {\n\t\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });\n\t\t\t}"
           assert old_state in router
@@ -69,6 +70,69 @@ jobs:
           \t\t\t\t}"""
           assert old_delegate in router
           router = router.replace(old_delegate, new_delegate, 1)
+
+          old_entry = """\tindex: number;
+          \tkey: string;
+          \turl: string;"""
+          new_entry = """\tindex: number;
+          \tkey: string;
+          \tsameDocument: boolean;
+          \turl: string;"""
+          assert old_entry in router
+          router = router.replace(old_entry, new_entry, 1)
+
+          old_listener = "\taddEventListener: (type: 'navigate', listener: (event: NavigateEvent) => void) => void;"
+          new_listener = """\taddEventListener: {
+          \t\t(type: 'navigate', listener: (event: NavigateEvent) => void): void;
+          \t\t(
+          \t\t\ttype: 'currententrychange',
+          \t\t\tlistener: (event: NavigationCurrentEntryChangeEvent) => void,
+          \t\t): void;
+          \t};"""
+          assert old_listener in router
+          router = router.replace(old_listener, new_listener, 1)
+
+          old_event_end = """\tscroll: () => void;
+          };
+          type AstroNavigationRequest"""
+          new_event_end = """\tscroll: () => void;
+          };
+          type NavigationCurrentEntryChangeEvent = {
+          \tfrom: NavigationHistoryEntry;
+          \tnavigationType: NavigateEvent['navigationType'] | null;
+          };
+          type AstroNavigationRequest"""
+          assert old_event_end in router
+          router = router.replace(old_event_end, new_event_end, 1)
+
+          save_scroll = """function saveNavigationScrollPosition() {
+          \tconst entry = navigationApi?.currentEntry;
+          \tif (entry && navigationEntries.has(entry.key)) {
+          \t\tnavigationScrollPositions.set(entry.key, { scrollX, scrollY });
+          \t}
+          }"""
+          current_entry_change = save_scroll + """
+
+          function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {
+          \tconst currentEntry = navigationApi?.currentEntry;
+          \tif (
+          \t\tcurrentEntry &&
+          \t\t!navigationEntries.has(currentEntry.key) &&
+          \t\tnavigationEntries.has(event.from.key) &&
+          \t\tcurrentEntry.sameDocument
+          \t) {
+          \t\ttrackNavigationEntry(currentEntry);
+          \t}
+          }"""
+          assert save_scroll in router
+          router = router.replace(save_scroll, current_entry_change, 1)
+
+          old_init_listener = "\t\t\tnavigationApi.addEventListener('navigate', onNavigate);"
+          new_init_listener = """\t\t\tnavigationApi.addEventListener('navigate', onNavigate);
+          \t\t\tnavigationApi.addEventListener('currententrychange', onNavigationCurrentEntryChange);"""
+          assert old_init_listener in router
+          router = router.replace(old_init_listener, new_init_listener, 1)
+
           path.write_text(router)
           PY
           git diff --check
@@ -76,11 +140,17 @@ jobs:
       - name: Build
         run: pnpm run build
 
-      - name: Focused regressions
+      - name: Focused traversal regressions
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0
-          --grep="Back button is captured|cross-route fragments|runs lifecycle events once|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts"
+          --grep="Back button is captured|cross-route fragments|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts"
+
+      - name: Framework router stress
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=20
+          --grep="Use the client side router in framework components"
 
       - name: Full View Transitions Chrome suite
         run: pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts --project="Chrome Stable" --workers=1 --retries=0
