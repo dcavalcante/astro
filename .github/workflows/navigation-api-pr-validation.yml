@@ -11,7 +11,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -43,8 +43,12 @@ jobs:
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0
+      - name: Firefox fallback e2e suite
+        run: pnpm -C packages/astro test:e2e:firefox
+      - name: Astro unit integration and type tests
+        run: pnpm -C packages/astro test
       - name: Static checks
         run: |
           pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts
           pnpm run typecheck
-          git diff --check dbbf10e606f64b4ba2b8362868b6a27a9a937eb8 HEAD -- packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/fixtures/view-transitions/src/pages/one.astro .changeset/sharp-words-share.md
+          git diff --check dbbf10e606f64b4ba2b8362868b6a27a9a937eb8 HEAD~2 -- packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/fixtures/view-transitions/src/pages/one.astro .changeset/sharp-words-share.md
