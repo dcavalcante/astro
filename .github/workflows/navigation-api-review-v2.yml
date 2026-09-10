@@ -1,0 +1,99 @@
+name: Navigation API review v2
+
+on:
+  push:
+    branches:
+      - review/navigation-api-client-router-final
+
+permissions:
+  contents: write
+
+jobs:
+  review:
+    if: github.event.head_commit.message == 'chore: run Navigation API review v2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install
+
+      - name: Recreate candidate and apply v2 fixes
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          old_workflow = subprocess.check_output(
+              ['git', 'show', 'HEAD~2:.github/workflows/navigation-api-review.yml'],
+              text=True,
+          )
+          marker = "          python <<'PY'\n"
+          start = old_workflow.index(marker) + len(marker)
+          end = old_workflow.index("\n          PY\n", start)
+          script = old_workflow[start:end]
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in script.splitlines()
+          )
+          exec(compile(script, 'navigation-api-review-v1.py', 'exec'))
+
+          path = Path('packages/astro/src/transitions/router.ts')
+          router = path.read_text()
+          router = router.replace(
+              "\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });",
+              "\t\t\tif (options.state !== undefined) {\n\t\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });\n\t\t\t}",
+              1,
+          )
+          old_delegate = """\t\t\t\tif (preparedEvent.defaultPrevented || preparedEvent.to.origin !== location.origin) {
+          \t\t\t\t\tbypassNavigationApi = true;
+          \t\t\t\t\tlocation.href = preparedEvent.to.href;
+          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
+          \t\t\t\t}"""
+          new_delegate = """\t\t\t\tif (preparedEvent.defaultPrevented) {
+          \t\t\t\t\tbypassNavigationApi = true;
+          \t\t\t\t\tlocation.href = to.href;
+          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
+          \t\t\t\t}
+          \t\t\t\tif (preparedEvent.to.origin !== location.origin) {
+          \t\t\t\t\tbypassNavigationApi = true;
+          \t\t\t\t\tlocation.href = preparedEvent.to.href;
+          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
+          \t\t\t\t}"""
+          assert old_delegate in router
+          router = router.replace(old_delegate, new_delegate, 1)
+          path.write_text(router)
+          PY
+          git diff --check
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Focused regressions
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0
+          --grep="Back button is captured|cross-route fragments|runs lifecycle events once|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts"
+
+      - name: Full View Transitions Chrome suite
+        run: pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts --project="Chrome Stable" --workers=1 --retries=0
+
+      - name: Check changed source
+        run: |
+          pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts
+          pnpm run typecheck
+
+      - name: Commit validated source
+        run: |
+          git config user.name "Daniel Cavalcante"
+          git config user.email "dcavalcante@gmail.com"
+          git add packages/astro/src/transitions/router.ts packages/astro/e2e/view-transitions.test.ts
+          git commit -m "fix(transitions): harden Navigation API routing"
+          git push
