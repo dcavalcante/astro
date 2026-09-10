@@ -52,7 +52,10 @@ async function expectNoAstroPreparation(page: import('@playwright/test').Page) {
 	).toBe(0);
 }
 
-test('does not claim pushed entries owned by another Navigation API router', async ({ page, astro }) => {
+test('does not claim pushed entries owned by another Navigation API router', async ({
+	page,
+	astro,
+}) => {
 	await page.goto(astro.resolveUrl('/one'));
 	await expectNavigationApi(page);
 	await installExternalRouter(page);
@@ -84,10 +87,12 @@ test('does not claim replaced entries owned by another Navigation API router', a
 
 	await page.evaluate(async () => {
 		const navigation = (window as Window & { navigation: any }).navigation;
-		await navigation.navigate('/two?external-router=replace', {
-			history: 'replace',
-			info: { externalRouter: true },
-		}).finished;
+		await navigation
+			.navigate('/two?external-router=replace', {
+				history: 'replace',
+				info: { externalRouter: true },
+			})
+			.finished;
 	});
 	await expect(page).toHaveURL(/\/two\?external-router=replace$/);
 
