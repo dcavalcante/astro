@@ -1,4 +1,4 @@
-name: Navigation API review v7
+name: Navigation API review v8
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   review:
-    if: github.event.head_commit.message == 'review navigation api v7'
+    if: github.event.head_commit.message == 'review navigation api v8'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -63,16 +63,16 @@ jobs:
 
           router_path = Path('packages/astro/src/transitions/router.ts')
           router = router_path.read_text()
-          old_scroll = """\t\t\ttrackNavigationEntry();
-          \t\t\tnavigationEvent.scroll();"""
-          new_scroll = """\t\t\ttrackNavigationEntry();
-          \t\t\tif (swapEvent.to.hash) {
-          \t\t\t\tnavigationEvent.scroll();
-          \t\t\t} else {
-          \t\t\t\tscrollTo({ left: 0, top: 0, behavior: 'instant' });
+          old_state = """\t\t\thistory.replaceState(options.state ?? null, '');
+          \t\t\tif (options.state !== undefined) {
+          \t\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });
           \t\t\t}"""
-          assert old_scroll in router
-          router = router.replace(old_scroll, new_scroll, 1)
+          new_state = """\t\t\tif (options.state !== undefined) {
+          \t\t\t\thistory.replaceState(options.state, '');
+          \t\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });
+          \t\t\t}"""
+          assert old_state in router
+          router = router.replace(old_state, new_state, 1)
           router_path.write_text(router)
           PY
           git diff --check
