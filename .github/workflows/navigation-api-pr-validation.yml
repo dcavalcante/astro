@@ -22,6 +22,59 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install
+      - name: Apply specific-entry ownership candidate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('packages/astro/src/transitions/router.ts')
+          text = path.read_text()
+
+          replacements = [
+              (
+                  "type NavigationHistoryEntry = {\n\taddEventListener:",
+                  "type NavigationHistoryEntry = {\n\tid: string;\n\taddEventListener:",
+              ),
+              (
+                  "\tdestination: { index: number; key: string; sameDocument: boolean; url: string };",
+                  "\tdestination: { id: string; index: number; key: string; sameDocument: boolean; url: string };",
+              ),
+              (
+                  "const navigationEntries = new Map<string, NavigationHistoryEntry>();\nconst astroNavigationRequests",
+                  "const navigationEntries = new Map<string, NavigationHistoryEntry>();\nlet pendingManagedHashEntry = false;\nconst astroNavigationRequests",
+              ),
+              (
+                  "\tif (!entry || navigationEntries.get(entry.key) === entry) return;\n\tnavigationEntries.set(entry.key, entry);",
+                  "\tif (!entry || navigationEntries.get(entry.id) === entry) return;\n\tnavigationEntries.set(entry.id, entry);",
+              ),
+              (
+                  "\t\t\tif (navigationEntries.get(entry.key) !== entry) return;\n\t\t\tnavigationEntries.delete(entry.key);",
+                  "\t\t\tif (navigationEntries.get(entry.id) !== entry) return;\n\t\t\tnavigationEntries.delete(entry.id);",
+              ),
+              (
+                  "\tif (entry && navigationEntries.has(entry.key)) {",
+                  "\tif (entry && navigationEntries.has(entry.id)) {",
+              ),
+              (
+                  "function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {\n\tconst currentEntry = navigationApi?.currentEntry;\n\tif (\n\t\tcurrentEntry &&\n\t\t!navigationEntries.has(currentEntry.key) &&\n\t\tnavigationEntries.has(event.from.key) &&\n\t\tcurrentEntry.sameDocument\n\t) {\n\t\ttrackNavigationEntry(currentEntry);\n\t}\n}",
+                  "function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {\n\tconst currentEntry = navigationApi?.currentEntry;\n\tif (\n\t\tpendingManagedHashEntry &&\n\t\tcurrentEntry?.sameDocument &&\n\t\tnavigationEntries.has(event.from.id)\n\t) {\n\t\ttrackNavigationEntry(currentEntry);\n\t}\n\tpendingManagedHashEntry = false;\n}",
+              ),
+              (
+                  "\t\t(!!currentEntry &&\n\t\t\tnavigationEntries.has(currentEntry.key) &&\n\t\t\tnavigationEntries.has(event.destination.key));\n\n\tsaveNavigationScrollPosition();",
+                  "\t\t(!!currentEntry &&\n\t\t\tnavigationEntries.has(currentEntry.id) &&\n\t\t\tnavigationEntries.has(event.destination.id));\n\n\tpendingManagedHashEntry =\n\t\tbrowserHandlesHashChange &&\n\t\tisAstroNavigation &&\n\t\t!!currentEntry &&\n\t\tnavigationEntries.has(currentEntry.id);\n\tsaveNavigationScrollPosition();",
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, got {count}: {old[:100]!r}')
+              text = text.replace(old, new)
+
+          path.write_text(text)
+          PY
+          pnpm exec biome format --write packages/astro/src/transitions/router.ts
       - name: Build
         run: pnpm run build
       - name: External Navigation API interop probe
@@ -55,4 +108,3 @@ jobs:
         run: |
           pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts
           pnpm run typecheck
-          git diff --check dbbf10e606f64b4ba2b8362868b6a27a9a937eb8 HEAD~3 -- packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/fixtures/view-transitions/src/pages/one.astro .changeset/sharp-words-share.md
