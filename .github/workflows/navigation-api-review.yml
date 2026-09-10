@@ -1,0 +1,616 @@
+name: Navigation API review
+
+on:
+  push:
+    branches:
+      - review/navigation-api-client-router-final
+
+permissions:
+  contents: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install
+
+      - name: Apply reviewed implementation and regression tests
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          router_path = Path('packages/astro/src/transitions/router.ts')
+          test_path = Path('packages/astro/e2e/view-transitions.test.ts')
+          router = router_path.read_text()
+          tests = test_path.read_text()
+
+          old_types = '''type Navigation = { controller: AbortController };
+          type FetchedHTML = { html: string; redirected?: string; mediaType: DOMParserSupportedType };
+          type NavigationApi = {
+          \taddEventListener: (type: 'navigate', listener: (event: NavigateEvent) => void) => void;
+          \tcurrentEntry: { index: number; key: string; url: string } | null;
+          \tnavigate: (url: string, options?: { history?: Options['history']; info?: Options }) => unknown;
+          };
+          type NavigateEvent = {
+          \tcanIntercept: boolean;
+          \tdestination: { index: number; key: string; url: string };
+          \tformData?: FormData;
+          \thasUAVisualTransition?: boolean;
+          \thashChange: boolean;
+          \tinfo?: Options;
+          \tnavigationType: 'push' | 'replace' | 'reload' | 'traverse';
+          \tsignal: AbortSignal;
+          \tsourceElement?: Element;
+          \tintercept: (options: {
+          \t\tfocusReset: 'manual';
+          \t\thandler: () => Promise<void>;
+          \t\tprecommitHandler?: () => Promise<void>;
+          \t\tscroll: 'manual';
+          \t}) => void;
+          \tscroll: () => void;
+          };'''
+          new_types = '''type Navigation = { controller: AbortController };
+          type FetchedHTML = { html: string; redirected?: string; mediaType: DOMParserSupportedType };
+          type NavigationHistoryEntry = {
+          \taddEventListener: (
+          \t\ttype: 'dispose',
+          \t\tlistener: () => void,
+          \t\toptions?: { once?: boolean },
+          \t) => void;
+          \tgetState: () => unknown;
+          \tindex: number;
+          \tkey: string;
+          \turl: string;
+          };
+          type NavigationResult = { committed: Promise<unknown>; finished: Promise<unknown> };
+          type NavigationPrecommitController = {
+          \tredirect: (
+          \t\turl: string,
+          \t\toptions?: { history?: Options['history']; info?: unknown; state?: unknown },
+          \t) => void;
+          };
+          type NavigationApi = {
+          \taddEventListener: (type: 'navigate', listener: (event: NavigateEvent) => void) => void;
+          \tcurrentEntry: NavigationHistoryEntry | null;
+          \tnavigate: (
+          \t\turl: string,
+          \t\toptions?: { history?: Options['history']; info?: unknown; state?: unknown },
+          \t) => NavigationResult;
+          \tupdateCurrentEntry: (options: { state: unknown }) => void;
+          };
+          type NavigateEvent = {
+          \tcanIntercept: boolean;
+          \tcancelable: boolean;
+          \tdestination: { index: number; key: string; sameDocument: boolean; url: string };
+          \tformData?: FormData;
+          \thasUAVisualTransition?: boolean;
+          \thashChange: boolean;
+          \tinfo?: unknown;
+          \tnavigationType: 'push' | 'replace' | 'reload' | 'traverse';
+          \tsignal: AbortSignal;
+          \tsourceElement?: Element;
+          \tintercept: (options: {
+          \t\tfocusReset: 'manual';
+          \t\thandler: () => Promise<void>;
+          \t\tprecommitHandler?: (controller: NavigationPrecommitController) => Promise<void>;
+          \t\tscroll: 'manual';
+          \t}) => void;
+          \tscroll: () => void;
+          };
+          type AstroNavigationRequest = { intercepted: boolean; options: Options };'''
+          assert old_types in router
+          router = router.replace(old_types, new_types, 1)
+
+          old_api = '''const inBrowser = import.meta.env.SSR === false;
+          const navigationApi = inBrowser
+          \t? (window as Window & { navigation?: NavigationApi }).navigation
+          \t: undefined;
+
+          export const supportsViewTransitions = inBrowser && !!document.startViewTransition;
+          export const supportsNavigationApi = !!navigationApi;'''
+          new_api = '''const inBrowser = import.meta.env.SSR === false;
+          const rawNavigationApi = inBrowser
+          \t? (window as Window & { navigation?: NavigationApi }).navigation
+          \t: undefined;
+          const supportsNavigationPrecommit =
+          \tinBrowser &&
+          \ttypeof (window as Window & { NavigationPrecommitController?: unknown })
+          \t\t.NavigationPrecommitController === 'function';
+          const navigationApi = supportsNavigationPrecommit ? rawNavigationApi : undefined;
+
+          export const supportsViewTransitions = inBrowser && !!document.startViewTransition;
+          export const supportsNavigationApi = !!navigationApi;'''
+          assert old_api in router
+          router = router.replace(old_api, new_api, 1)
+
+          old_globals = '''let currentHistoryIndex = 0;
+          let bypassNavigationApi = false;
+          const navigationScrollPositions = new Map<string, { scrollX: number; scrollY: number }>();
+          let navigationInProgress: NavigateEvent | undefined;'''
+          new_globals = '''let currentHistoryIndex = 0;
+          let bypassNavigationApi = false;
+          const navigationScrollPositions = new Map<string, { scrollX: number; scrollY: number }>();
+          const navigationEntries = new Map<string, NavigationHistoryEntry>();
+          const astroNavigationRequests = new WeakMap<object, AstroNavigationRequest>();'''
+          assert old_globals in router
+          router = router.replace(old_globals, new_globals, 1)
+
+          legacy_end = '''\t}
+          }
+
+          // returns the contents of the page or null if the router can't deal with it.'''
+          helpers = '''\t}
+          }
+
+          function trackNavigationEntry(entry = navigationApi?.currentEntry) {
+          \tif (!entry || navigationEntries.get(entry.key) === entry) return;
+          \tnavigationEntries.set(entry.key, entry);
+          \tentry.addEventListener(
+          \t\t'dispose',
+          \t\t() => {
+          \t\t\tif (navigationEntries.get(entry.key) !== entry) return;
+          \t\t\tnavigationEntries.delete(entry.key);
+          \t\t\tnavigationScrollPositions.delete(entry.key);
+          \t\t},
+          \t\t{ once: true },
+          \t);
+          }
+
+          function saveNavigationScrollPosition() {
+          \tconst entry = navigationApi?.currentEntry;
+          \tif (entry && navigationEntries.has(entry.key)) {
+          \t\tnavigationScrollPositions.set(entry.key, { scrollX, scrollY });
+          \t}
+          }
+
+          // returns the contents of the page or null if the router can't deal with it.'''
+          assert legacy_end in router
+          router = router.replace(legacy_end, helpers, 1)
+
+          # Move the real loader out of transition() so push/replace preparation can run in precommit.
+          start = router.index('\n\tasync function defaultLoader(preparationEvent: TransitionBeforePreparationEvent) {')
+          end = router.index('\n\tasync function abortAndRecreateMostRecentTransition', start)
+          loader = router[start + 1:end]
+          loader = '\n'.join(line[1:] if line.startswith('\t') else line for line in loader.splitlines())
+          loader = loader.replace(
+              'async function defaultLoader(preparationEvent: TransitionBeforePreparationEvent) {',
+              'async function defaultLoader(preparationEvent: TransitionBeforePreparationEvent, from: URL) {',
+              1,
+          )
+          old_response = '''\tconst response = preloadedResponse ?? (await fetchHTML(href, init));
+          \tpreloadedResponse = undefined;'''
+          assert old_response in loader
+          loader = loader.replace(old_response, '\tconst response = await fetchHTML(href, init);', 1)
+          router = router[:start] + router[end:]
+          insert_at = router.index('async function transition(')
+          router = router[:insert_at] + loader + '\n\n' + router[insert_at:]
+
+          router = router.replace(
+              '\tpreloadedResponse?: FetchedHTML,\n) {',
+              '\tpreparedEvent?: TransitionBeforePreparationEvent,\n) {',
+              1,
+          )
+          router = router.replace(
+              '\tif (samePage(from, to) && !options.formData) {',
+              '\tif (!navigationEvent && samePage(from, to) && !options.formData) {',
+              1,
+          )
+
+          old_prep = '''\tconst prepEvent = await doPreparation(
+          \t\tfrom,
+          \t\tto,
+          \t\tdirection,
+          \t\tnavigationType,
+          \t\toptions.sourceElement,
+          \t\toptions.info,
+          \t\tcurrentNavigation!.controller.signal,
+          \t\toptions.formData,
+          \t\tdefaultLoader,
+          \t\t!navigationEvent,
+          \t);'''
+          new_prep = '''\tconst prepEvent =
+          \t\tpreparedEvent ??
+          \t\t(await doPreparation(
+          \t\t\tfrom,
+          \t\t\tto,
+          \t\t\tdirection,
+          \t\t\tnavigationType,
+          \t\t\toptions.sourceElement,
+          \t\t\toptions.info,
+          \t\t\tcurrentNavigation!.controller.signal,
+          \t\t\toptions.formData,
+          \t\t\t(event) => defaultLoader(event, from),
+          \t\t\t!navigationEvent,
+          \t\t));'''
+          assert old_prep in router
+          router = router.replace(old_prep, new_prep, 1)
+
+          old_nav_update = '''\tif (navigationEvent) {
+          \t\toriginalLocation = swapEvent.to;
+          \t\tif (navigationEvent.navigationType === 'traverse') {
+          \t\t\tconst scrollPosition = navigationScrollPositions.get(navigationEvent.destination.key);
+          \t\t\tif (scrollPosition) {
+          \t\t\t\tscrollTo(scrollPosition.scrollX, scrollPosition.scrollY);
+          \t\t\t} else {
+          \t\t\t\tnavigationEvent.scroll();
+          \t\t\t}
+          \t\t} else {
+          \t\t\tnavigationEvent.scroll();
+          \t\t}
+          \t} else {'''
+          new_nav_update = '''\tif (navigationEvent) {
+          \t\toriginalLocation = swapEvent.to;
+          \t\tif (navigationEvent.navigationType === 'traverse') {
+          \t\t\tconst scrollPosition = navigationScrollPositions.get(navigationEvent.destination.key);
+          \t\t\tif (scrollPosition) {
+          \t\t\t\tscrollTo(scrollPosition.scrollX, scrollPosition.scrollY);
+          \t\t\t} else {
+          \t\t\t\tnavigationEvent.scroll();
+          \t\t\t}
+          \t\t} else {
+          \t\t\t// Navigation API state and classic history.state are separate. Keep the public
+          \t\t\t// navigate({ state }) behavior visible through both APIs.
+          \t\t\thistory.replaceState(options.state ?? null, '');
+          \t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });
+          \t\t\ttrackNavigationEntry();
+          \t\t\tnavigationEvent.scroll();
+          \t\t}
+          \t} else {'''
+          assert old_nav_update in router
+          router = router.replace(old_nav_update, new_nav_update, 1)
+
+          old_navigate = '''\tif (navigationApi) {
+          \t\tnavigationApi.navigate(new URL(href, location.href).href, {
+          \t\t\thistory: options?.history ?? 'auto',
+          \t\t\tinfo: options ?? {},
+          \t\t});
+          \t\treturn;
+          \t}'''
+          new_navigate = '''\tif (navigationApi) {
+          \t\tconst to = new URL(href, location.href);
+          \t\tconst request: AstroNavigationRequest = { intercepted: false, options: options ?? {} };
+          \t\tconst info = {};
+          \t\tastroNavigationRequests.set(info, request);
+          \t\tconst result = navigationApi.navigate(to.href, {
+          \t\t\thistory: request.options.history ?? 'auto',
+          \t\t\tinfo,
+          \t\t\tstate: request.options.state,
+          \t\t});
+          \t\t// The navigate event is dispatched synchronously. If Astro did not intercept it,
+          \t\t// the browser owns the navigation and cross-document promises may never settle.
+          \t\tif (!request.intercepted) return;
+          \t\ttry {
+          \t\t\tawait result.finished;
+          \t\t} catch (error) {
+          \t\t\t// Superseded navigations and navigations delegated back to the browser abort the
+          \t\t\t// intercepted navigation. The History API implementation did not surface that abort.
+          \t\t\tif (error instanceof DOMException && error.name === 'AbortError') return;
+          \t\t\tthrow error;
+          \t\t}
+          \t\treturn;
+          \t}'''
+          assert old_navigate in router
+          router = router.replace(old_navigate, new_navigate, 1)
+
+          on_start = router.index('function onNavigate(event: NavigateEvent) {')
+          on_end = router.index('\nfunction onNavigationScroll()', on_start)
+          new_on = '''function onNavigate(event: NavigateEvent) {
+          \tif (bypassNavigationApi) {
+          \t\tbypassNavigationApi = false;
+          \t\treturn;
+          \t}
+          \tif (!transitionEnabledOnThisPage()) return;
+
+          \tconst navigationType = event.navigationType;
+          \tconst request =
+          \t\ttypeof event.info === 'object' && event.info !== null
+          \t\t\t? astroNavigationRequests.get(event.info)
+          \t\t\t: undefined;
+          \tconst isAstroNavigation = request !== undefined;
+          \tconst options = request?.options ?? {};
+          \tconst formData = event.formData ?? options.formData;
+          \tconst currentEntry = navigationApi?.currentEntry;
+          \tconst from = new URL(currentEntry?.url ?? location.href);
+          \tconst to = new URL(event.destination.url);
+          \tconst direction: Direction =
+          \t\tnavigationType === 'traverse' && event.destination.index < (currentEntry?.index ?? 0)
+          \t\t\t? 'back'
+          \t\t\t: 'forward';
+          \tconst browserHandlesHashChange =
+          \t\t!formData &&
+          \t\tevent.hashChange &&
+          \t\t((direction !== 'back' && !!to.hash) || (direction === 'back' && !!from.hash));
+          \tconst needsPrecommit = navigationType === 'push' || navigationType === 'replace';
+          \tconst managedTraverse =
+          \t\tnavigationType !== 'traverse' ||
+          \t\t(!!currentEntry &&
+          \t\t\tnavigationEntries.has(currentEntry.key) &&
+          \t\t\tnavigationEntries.has(event.destination.key));
+
+          \tsaveNavigationScrollPosition();
+
+          \tif (
+          \t\t(needsPrecommit && !isAstroNavigation) ||
+          \t\t(needsPrecommit && !event.cancelable) ||
+          \t\t(navigationType === 'traverse' && (!event.destination.sameDocument || !managedTraverse)) ||
+          \t\t!event.canIntercept ||
+          \t\tbrowserHandlesHashChange ||
+          \t\tlocation.origin !== to.origin ||
+          \t\tnavigationType === 'reload'
+          \t) {
+          \t\treturn;
+          \t}
+
+          \tlet preparedEvent: TransitionBeforePreparationEvent | undefined;
+          \tevent.intercept({
+          \t\tfocusReset: 'manual',
+          \t\tprecommitHandler: needsPrecommit
+          \t\t\t? async (controller) => {
+          \t\t\t\tpreparedEvent = await doPreparation(
+          \t\t\t\t\tfrom,
+          \t\t\t\t\tto,
+          \t\t\t\t\tdirection,
+          \t\t\t\t\tnavigationType,
+          \t\t\t\t\toptions.sourceElement ?? event.sourceElement,
+          \t\t\t\t\toptions.info,
+          \t\t\t\t\tevent.signal,
+          \t\t\t\t\tformData,
+          \t\t\t\t\t(preparationEvent) => defaultLoader(preparationEvent, from),
+          \t\t\t\t\tfalse,
+          \t\t\t\t);
+          \t\t\t\tif (event.signal.aborted) {
+          \t\t\t\t\tthrow event.signal.reason ?? new DOMException('Navigation aborted', 'AbortError');
+          \t\t\t\t}
+          \t\t\t\tif (preparedEvent.defaultPrevented || preparedEvent.to.origin !== location.origin) {
+          \t\t\t\t\tbypassNavigationApi = true;
+          \t\t\t\t\tlocation.href = preparedEvent.to.href;
+          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
+          \t\t\t\t}
+          \t\t\t\tif (preparedEvent.to.href !== to.href) {
+          \t\t\t\t\tcontroller.redirect(preparedEvent.to.href, {
+          \t\t\t\t\t\thistory: options.history ?? 'auto',
+          \t\t\t\t\t\tinfo: event.info,
+          \t\t\t\t\t\tstate: options.state,
+          \t\t\t\t\t});
+          \t\t\t\t}
+          \t\t\t}
+          \t\t\t: undefined,
+          \t\tscroll: 'manual',
+          \t\thandler: async () => {
+          \t\t\tawait transition(
+          \t\t\t\tdirection,
+          \t\t\t\tfrom,
+          \t\t\t\tpreparedEvent?.to ?? new URL(event.destination.url),
+          \t\t\t\t{
+          \t\t\t\t\t...options,
+          \t\t\t\t\tsourceElement: options.sourceElement ?? event.sourceElement,
+          \t\t\t\t\tformData,
+          \t\t\t\t},
+          \t\t\t\tundefined,
+          \t\t\t\tevent.hasUAVisualTransition ?? false,
+          \t\t\t\tnavigationType,
+          \t\t\t\tevent,
+          \t\t\t\tpreparedEvent,
+          \t\t\t);
+          \t\t},
+          \t});
+          \tif (request) request.intercepted = true;
+          }
+          '''
+          router = router[:on_start] + new_on + router[on_end:]
+
+          scroll_start = router.index('function onNavigationScroll() {')
+          pop_start = router.index('function onPopState(', scroll_start)
+          router = router[:scroll_start] + router[pop_start:]
+
+          old_init = '''\t\toriginalLocation = new URL(location.href);
+          \t\tif (navigationApi) navigationApi.addEventListener('navigate', onNavigate);
+          \t\telse addEventListener('popstate', onPopState);
+          \t\taddEventListener('load', onPageLoad);
+          \t\tif (navigationApi) addEventListener('scroll', onNavigationScroll, { passive: true });'''
+          new_init = '''\t\toriginalLocation = new URL(location.href);
+          \t\tif (navigationApi) {
+          \t\t\tif (transitionEnabledOnThisPage()) trackNavigationEntry();
+          \t\t\tnavigationApi.addEventListener('navigate', onNavigate);
+          \t\t} else {
+          \t\t\taddEventListener('popstate', onPopState);
+          \t\t}
+          \t\taddEventListener('load', onPageLoad);'''
+          assert old_init in router
+          router = router.replace(old_init, new_init, 1)
+
+          router_path.write_text(router)
+
+          tests = tests.replace(
+              "\t\t\toptions?: { history?: 'auto' | 'replace' | 'push' },\n\t\t) => void;",
+              "\t\t\toptions?: { history?: 'auto' | 'replace' | 'push'; state?: any },\n\t\t) => Promise<void>;",
+              1,
+          )
+          tests = tests.replace(
+              "\treturn page.evaluate(\n\t\t() => typeof (window as Window & { navigation?: unknown }).navigation === 'object',\n\t);",
+              "\treturn page.evaluate(\n\t\t() =>\n\t\t\ttypeof (window as Window & { navigation?: unknown }).navigation === 'object' &&\n\t\t\ttypeof (window as Window & { NavigationPrecommitController?: unknown })\n\t\t\t\t.NavigationPrecommitController === 'function',\n\t);",
+              1,
+          )
+
+          title = "\ttest('Moving to a page which redirects to another'"
+          pos = tests.index(title)
+          next_test = tests.find('\n\ttest(', pos + 1)
+          section = tests[pos:next_test]
+          anchor = "\t\tp = page.locator('#two');\n\t\tawait expect(p, 'should have content').toHaveText('Page 2');"
+          assert anchor in section
+          section = section.replace(anchor, anchor + "\n\t\tawait expect(page).toHaveURL(/\\/two$/);", 1)
+          tests = tests[:pos] + section + tests[next_test:]
+
+          title = "\ttest('Hash part of the target URL is preserved during server redirect'"
+          pos = tests.index(title)
+          next_test = tests.find('\n\ttest(', pos + 1)
+          section = tests[pos:next_test]
+          assert anchor in section
+          section = section.replace(anchor, anchor + "\n\t\tawait expect(page).toHaveURL(/\\/two#bottom$/);", 1)
+          tests = tests[:pos] + section + tests[next_test:]
+
+          for title_text in [
+              'form POST that redirects to another page is handled',
+              'form GET that redirects to another page is handled',
+          ]:
+              pos = tests.index(f"\ttest('{title_text}'")
+              next_test = tests.find('\n\ttest(', pos + 1)
+              section = tests[pos:next_test]
+              form_anchor = "\t\tawait expect(span, 'should have content').toHaveText('Testing');"
+              assert form_anchor in section
+              section = section.replace(
+                  form_anchor,
+                  form_anchor + "\n\t\tawait expect(page).toHaveURL(/\\/form-response\\?name=Testing$/);",
+                  1,
+              )
+              tests = tests[:pos] + section + tests[next_test:]
+
+          nav_anchor = "\ttest('Navigation API push and replace navigation use the native history entries', async ({"
+          insert = '''\ttest('Navigation API preserves navigate state and await completion', async ({ page, astro }) => {
+          \t\tawait page.goto(astro.resolveUrl('/six'));
+          \t\tawait expect(page.locator('#one')).toHaveText('Page 1');
+          \t\tif (!(await hasNavigationApi(page))) test.skip();
+
+          \t\tconst result = await page.evaluate(async () => {
+          \t\t\tlet swapped = false;
+          \t\t\tdocument.addEventListener('astro:after-swap', () => (swapped = true), { once: true });
+          \t\t\tawait window.clientSideRouterForTestsParkedHere!('/two', { state: { answer: 42 } });
+          \t\t\tconst navigation = (
+          \t\t\t\twindow as Window & {
+          \t\t\t\t\tnavigation: { currentEntry: { getState: () => unknown } };
+          \t\t\t\t}
+          \t\t\t).navigation;
+          \t\t\treturn {
+          \t\t\t\tswapped,
+          \t\t\t\tpathname: location.pathname,
+          \t\t\t\tnavigationState: navigation.currentEntry.getState(),
+          \t\t\t\thistoryState: history.state,
+          \t\t\t};
+          \t\t});
+
+          \t\texpect(result).toEqual({
+          \t\t\tswapped: true,
+          \t\t\tpathname: '/two',
+          \t\t\tnavigationState: { answer: 42 },
+          \t\t\thistoryState: { answer: 42 },
+          \t\t});
+          \t});
+
+          \ttest('Navigation API runs custom preparation loaders before committing', async ({ page, astro }) => {
+          \t\tawait page.goto(astro.resolveUrl('/one'));
+          \t\tif (!(await hasNavigationApi(page))) test.skip();
+          \t\tconst requests: string[] = [];
+          \t\tpage.on('request', (request) => {
+          \t\t\tif (new URL(request.url()).pathname === '/three') requests.push(request.url());
+          \t\t});
+          \t\tawait page.evaluate(() => {
+          \t\t\tdocument.addEventListener(
+          \t\t\t\t'astro:before-preparation',
+          \t\t\t\t(event) => {
+          \t\t\t\t\tconst transitionEvent = event as Event & {
+          \t\t\t\t\t\tloader: () => Promise<void>;
+          \t\t\t\t\t\tnewDocument: Document;
+          \t\t\t\t\t};
+          \t\t\t\t\ttransitionEvent.loader = async () => {
+          \t\t\t\t\t\tconst nextDocument = document.implementation.createHTMLDocument('Custom');
+          \t\t\t\t\t\tconst meta = nextDocument.createElement('meta');
+          \t\t\t\t\t\tmeta.setAttribute('name', 'astro-view-transitions-enabled');
+          \t\t\t\t\t\tnextDocument.head.append(meta);
+          \t\t\t\t\t\tnextDocument.body.innerHTML = '<p id="custom-loader-result">custom</p>';
+          \t\t\t\t\t\ttransitionEvent.newDocument = nextDocument;
+          \t\t\t\t\t};
+          \t\t\t\t},
+          \t\t\t\t{ once: true },
+          \t\t\t);
+          \t\t});
+
+          \t\tawait page.click('#click-three');
+          \t\tawait expect(page.locator('#custom-loader-result')).toHaveText('custom');
+          \t\texpect(requests).toEqual([]);
+          \t\tawait expect(page).toHaveURL(/\\/three$/);
+          \t});
+
+          \ttest('ClientRouter does not claim external Navigation API navigations with info', async ({ page, astro }) => {
+          \t\tconst expectLoads = collectLoads(page);
+          \t\tawait page.goto(astro.resolveUrl('/one'));
+          \t\tawait expectLoads(1);
+          \t\tif (!(await hasNavigationApi(page))) test.skip();
+          \t\tawait page.evaluate((url) => {
+          \t\t\t(
+          \t\t\t\twindow as Window & {
+          \t\t\t\t\tnavigation: { navigate: (url: string, options?: { info?: unknown }) => unknown };
+          \t\t\t\t}
+          \t\t\t).navigation.navigate(url, { info: { external: true } });
+          \t\t}, astro.resolveUrl('/two'));
+          \t\tawait expect(page.locator('#two')).toHaveText('Page 2');
+          \t\tawait expectLoads(2);
+          \t});
+
+          \ttest('ClientRouter does not intercept cross-document traversals', async ({ page, astro }) => {
+          \t\tawait page.goto(astro.resolveUrl('/three'));
+          \t\tawait page.goto(astro.resolveUrl('/one'));
+          \t\tif (!(await hasNavigationApi(page))) test.skip();
+          \t\tawait page.evaluate(() => {
+          \t\t\tlocalStorage.removeItem('astro-cross-document-traverse-intercepted');
+          \t\t\tdocument.addEventListener('astro:before-preparation', () => {
+          \t\t\t\tlocalStorage.setItem('astro-cross-document-traverse-intercepted', 'true');
+          \t\t\t});
+          \t\t});
+          \t\tawait page.goBack();
+          \t\tawait expect(page.locator('#three')).toHaveText('Page 3');
+          \t\texpect(
+          \t\t\tawait page.evaluate(() => localStorage.getItem('astro-cross-document-traverse-intercepted')),
+          \t\t).toBeNull();
+          \t});
+
+          \ttest('falls back to History API when Navigation precommit is unavailable', async ({ page, astro }) => {
+          \t\tawait page.addInitScript(() => {
+          \t\t\tObject.defineProperty(window, 'NavigationPrecommitController', {
+          \t\t\t\tconfigurable: true,
+          \t\t\t\tvalue: undefined,
+          \t\t\t});
+          \t\t});
+          \t\tawait page.goto(astro.resolveUrl('/one'));
+          \t\texpect(await page.evaluate(() => history.state?.index)).toBe(0);
+          \t\tawait page.click('#click-two');
+          \t\tawait expect(page.locator('#two')).toHaveText('Page 2');
+          \t\texpect(await page.evaluate(() => history.state?.index)).toBe(1);
+          \t});
+
+          '''
+          assert nav_anchor in tests
+          tests = tests.replace(nav_anchor, insert + nav_anchor, 1)
+          test_path.write_text(tests)
+          PY
+
+          git diff --check
+          git diff --stat
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Full View Transitions Chrome suite
+        run: pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts --project="Chrome Stable" --workers=1 --retries=0
+
+      - name: Check changed source
+        run: |
+          pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts
+          pnpm run typecheck
+
+      - name: Commit validated source
+        run: |
+          git config user.name "Daniel Cavalcante"
+          git config user.email "dcavalcante@gmail.com"
+          git add packages/astro/src/transitions/router.ts packages/astro/e2e/view-transitions.test.ts
+          git commit -m "fix(transitions): harden Navigation API routing"
+          git push
