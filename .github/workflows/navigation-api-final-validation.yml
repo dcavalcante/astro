@@ -1,0 +1,61 @@
+name: Navigation API final source validation
+
+on:
+  push:
+    branches:
+      - review/navigation-api-client-router-final-sha
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install
+      - name: Build
+        run: pnpm run build
+      - name: External Navigation API interoperability
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/navigation-api-interop.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0
+      - name: Focused navigation regressions
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0
+          --grep="No page rendering during swap|push navigation starts the destination at the top|cross-route fragments|Back button is captured|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts|Use the client side router in framework components"
+      - name: Swap rendering stress
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=20
+          --grep="No page rendering during swap"
+      - name: Framework router stress
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=10
+          --grep="Use the client side router in framework components"
+      - name: Full View Transitions Chrome suite
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0
+      - name: Install Firefox
+        run: pnpm -C packages/astro exec playwright install --with-deps firefox
+      - name: Firefox fallback e2e suite
+        run: pnpm -C packages/astro test:e2e:firefox
+      - name: Astro unit integration and type tests
+        if: ${{ always() && !cancelled() }}
+        run: pnpm -C packages/astro test
+      - name: Static checks
+        if: ${{ always() && !cancelled() }}
+        run: |
+          pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/navigation-api-interop.test.ts
+          pnpm run typecheck
