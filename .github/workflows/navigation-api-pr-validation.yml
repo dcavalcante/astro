@@ -11,7 +11,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -100,11 +100,15 @@ jobs:
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0
+      - name: Install Firefox
+        run: pnpm -C packages/astro exec playwright install --with-deps firefox
       - name: Firefox fallback e2e suite
         run: pnpm -C packages/astro test:e2e:firefox
       - name: Astro unit integration and type tests
+        if: ${{ always() && !cancelled() }}
         run: pnpm -C packages/astro test
       - name: Static checks
+        if: ${{ always() && !cancelled() }}
         run: |
           pnpm exec biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts
           pnpm run typecheck
