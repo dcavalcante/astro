@@ -1,4 +1,4 @@
-name: Navigation API review v5
+name: Navigation API review v6
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   review:
-    if: github.event.head_commit.message == 'review navigation api v5'
+    if: github.event.head_commit.message == 'review navigation api v6'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -24,159 +24,64 @@ jobs:
           cache: pnpm
       - run: pnpm install
 
-      - name: Baseline framework-router control
-        shell: bash
-        run: |
-          git reset --hard de5cc2d54e92d8746959e39fee1a8f0b4ddfe4bf
-          pnpm run build
-          set +e
-          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts \
-            --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=5 \
-            --grep="Use the client side router in framework components"
-          status=$?
-          set -e
-          echo "Baseline raw framework-router stress exit code: $status"
-          git reset --hard "$GITHUB_SHA"
-
-      - name: Recreate candidate and apply fixes
+      - name: Recreate reviewed candidate
         shell: bash
         run: |
           python <<'PY'
           from pathlib import Path
           import subprocess
 
-          old_workflow = subprocess.check_output(
-              ['git', 'show', '5fc593110adced39601332a859daa0ca8762567d:.github/workflows/navigation-api-review.yml'],
+          workflow = subprocess.check_output(
+              ['git', 'show', 'b76b73d0cbb023833035fb57acd4c8fd73187773:.github/workflows/navigation-api-review-v3.yml'],
               text=True,
           )
           marker = "          python <<'PY'\n"
-          start = old_workflow.index(marker) + len(marker)
-          end = old_workflow.index("\n          PY\n", start)
-          script = old_workflow[start:end]
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n          PY\n", start)
+          script = workflow[start:end]
           script = '\n'.join(
               line[10:] if line.startswith('          ') else line
               for line in script.splitlines()
           )
-          exec(compile(script, 'navigation-api-review-v1.py', 'exec'))
-
-          path = Path('packages/astro/src/transitions/router.ts')
-          router = path.read_text()
-
-          old_state = "\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });"
-          new_state = "\t\t\tif (options.state !== undefined) {\n\t\t\t\tnavigationApi?.updateCurrentEntry({ state: options.state });\n\t\t\t}"
-          assert old_state in router
-          router = router.replace(old_state, new_state, 1)
-
-          old_delegate = """\t\t\t\tif (preparedEvent.defaultPrevented || preparedEvent.to.origin !== location.origin) {
-          \t\t\t\t\tbypassNavigationApi = true;
-          \t\t\t\t\tlocation.href = preparedEvent.to.href;
-          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
-          \t\t\t\t}"""
-          new_delegate = """\t\t\t\tif (preparedEvent.defaultPrevented) {
-          \t\t\t\t\tbypassNavigationApi = true;
-          \t\t\t\t\tlocation.href = to.href;
-          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
-          \t\t\t\t}
-          \t\t\t\tif (preparedEvent.to.origin !== location.origin) {
-          \t\t\t\t\tbypassNavigationApi = true;
-          \t\t\t\t\tlocation.href = preparedEvent.to.href;
-          \t\t\t\t\tthrow new DOMException('Delegating navigation to the browser', 'AbortError');
-          \t\t\t\t}"""
-          assert old_delegate in router
-          router = router.replace(old_delegate, new_delegate, 1)
-
-          old_entry = """\tindex: number;
-          \tkey: string;
-          \turl: string;"""
-          new_entry = """\tindex: number;
-          \tkey: string;
-          \tsameDocument: boolean;
-          \turl: string;"""
-          assert old_entry in router
-          router = router.replace(old_entry, new_entry, 1)
-
-          old_listener = "\taddEventListener: (type: 'navigate', listener: (event: NavigateEvent) => void) => void;"
-          new_listener = """\taddEventListener: {
-          \t\t(type: 'navigate', listener: (event: NavigateEvent) => void): void;
-          \t\t(
-          \t\t\ttype: 'currententrychange',
-          \t\t\tlistener: (event: NavigationCurrentEntryChangeEvent) => void,
-          \t\t): void;
-          \t};"""
-          assert old_listener in router
-          router = router.replace(old_listener, new_listener, 1)
-
-          old_event_end = """\tscroll: () => void;
-          };
-          type AstroNavigationRequest"""
-          new_event_end = """\tscroll: () => void;
-          };
-          type NavigationCurrentEntryChangeEvent = {
-          \tfrom: NavigationHistoryEntry;
-          \tnavigationType: NavigateEvent['navigationType'] | null;
-          };
-          type AstroNavigationRequest"""
-          assert old_event_end in router
-          router = router.replace(old_event_end, new_event_end, 1)
-
-          save_scroll = """function saveNavigationScrollPosition() {
-          \tconst entry = navigationApi?.currentEntry;
-          \tif (entry && navigationEntries.has(entry.key)) {
-          \t\tnavigationScrollPositions.set(entry.key, { scrollX, scrollY });
-          \t}
-          }"""
-          current_entry_change = save_scroll + """
-
-          function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {
-          \tconst currentEntry = navigationApi?.currentEntry;
-          \tif (
-          \t\tcurrentEntry &&
-          \t\t!navigationEntries.has(currentEntry.key) &&
-          \t\tnavigationEntries.has(event.from.key) &&
-          \t\tcurrentEntry.sameDocument
-          \t) {
-          \t\ttrackNavigationEntry(currentEntry);
-          \t}
-          }"""
-          assert save_scroll in router
-          router = router.replace(save_scroll, current_entry_change, 1)
-
-          old_init_listener = "\t\t\tnavigationApi.addEventListener('navigate', onNavigate);"
-          new_init_listener = """\t\t\tnavigationApi.addEventListener('navigate', onNavigate);
-          \t\t\tnavigationApi.addEventListener('currententrychange', onNavigationCurrentEntryChange);"""
-          assert old_init_listener in router
-          router = router.replace(old_init_listener, new_init_listener, 1)
-          path.write_text(router)
+          exec(compile(script, 'navigation-api-review-v5.py', 'exec'))
 
           test_path = Path('packages/astro/e2e/view-transitions.test.ts')
           tests = test_path.read_text()
-          old_click = """\t\tawait expect(button, 'should have content').toHaveText('Navigate to `/two`');
-          \t\tawait button.click();"""
-          new_click = """\t\tawait expect(button, 'should have content').toHaveText('Navigate to `/two`');
-          \t\tawait expect(
-          \t\t\tpage.locator('astro-island:not([ssr]) #react-client-load-navigate-button'),
-          \t\t\t'should be hydrated',
-          \t\t).toHaveCount(1);
-          \t\tawait button.click();"""
-          assert old_click in tests
-          tests = tests.replace(old_click, new_click, 1)
+          old = """\t\texpect(animations.length).toEqual(1);
+
+          \t\t// go to page 2"""
+          new = """\t\texpect(animations.length).toEqual(1);
+          \t\t// Finish the setup animation before checking whether swap() causes a new render.
+          \t\tawait page.evaluate(async () => {
+          \t\t\tawait Promise.allSettled(document.getAnimations().map((animation) => animation.finished));
+          \t\t});
+
+          \t\t// go to page 2"""
+          assert old in tests
+          tests = tests.replace(old, new, 1)
           test_path.write_text(tests)
           PY
           git diff --check
 
-      - name: Build candidate
+      - name: Build
         run: pnpm run build
 
       - name: Focused regressions
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0
-          --grep="Back button is captured|cross-route fragments|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts|Use the client side router in framework components"
+          --grep="No page rendering during swap|Back button is captured|cross-route fragments|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts|Use the client side router in framework components"
 
-      - name: Hydrated framework router stress
+      - name: Swap rendering stress
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=20
+          --grep="No page rendering during swap"
+
+      - name: Framework router stress
+        run: >-
+          pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
+          --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=5
           --grep="Use the client side router in framework components"
 
       - name: Full View Transitions Chrome suite
