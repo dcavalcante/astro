@@ -12,29 +12,60 @@ type State = {
 };
 type Navigation = { controller: AbortController };
 type FetchedHTML = { html: string; redirected?: string; mediaType: DOMParserSupportedType };
+type NavigationHistoryEntry = {
+	addEventListener: (type: 'dispose', listener: () => void, options?: { once?: boolean }) => void;
+	getState: () => unknown;
+	index: number;
+	key: string;
+	sameDocument: boolean;
+	url: string;
+};
+type NavigationResult = { committed: Promise<unknown>; finished: Promise<unknown> };
+type NavigationPrecommitController = {
+	redirect: (
+		url: string,
+		options?: { history?: Options['history']; info?: unknown; state?: unknown },
+	) => void;
+};
 type NavigationApi = {
-	addEventListener: (type: 'navigate', listener: (event: NavigateEvent) => void) => void;
-	currentEntry: { index: number; key: string; url: string } | null;
-	navigate: (url: string, options?: { history?: Options['history']; info?: Options }) => unknown;
+	addEventListener: {
+		(type: 'navigate', listener: (event: NavigateEvent) => void): void;
+		(
+			type: 'currententrychange',
+			listener: (event: NavigationCurrentEntryChangeEvent) => void,
+		): void;
+	};
+	currentEntry: NavigationHistoryEntry | null;
+	navigate: (
+		url: string,
+		options?: { history?: Options['history']; info?: unknown; state?: unknown },
+	) => NavigationResult;
+	updateCurrentEntry: (options: { state: unknown }) => void;
 };
 type NavigateEvent = {
 	canIntercept: boolean;
-	destination: { index: number; key: string; url: string };
+	cancelable: boolean;
+	destination: { index: number; key: string; sameDocument: boolean; url: string };
 	formData?: FormData;
 	hasUAVisualTransition?: boolean;
 	hashChange: boolean;
-	info?: Options;
+	info?: unknown;
 	navigationType: 'push' | 'replace' | 'reload' | 'traverse';
 	signal: AbortSignal;
 	sourceElement?: Element;
 	intercept: (options: {
 		focusReset: 'manual';
 		handler: () => Promise<void>;
-		precommitHandler?: () => Promise<void>;
+		precommitHandler?: (controller: NavigationPrecommitController) => Promise<void>;
 		scroll: 'manual';
 	}) => void;
 	scroll: () => void;
 };
+type NavigationCurrentEntryChangeEvent = {
+	from: NavigationHistoryEntry;
+	navigationType: NavigateEvent['navigationType'] | null;
+};
+type AstroNavigationRequest = { intercepted: boolean; options: Options };
 type Transition = {
 	// The view transitions object (API and simulation)
 	viewTransition?: ViewTransition;
@@ -45,9 +76,14 @@ type Transition = {
 };
 
 const inBrowser = import.meta.env.SSR === false;
-const navigationApi = inBrowser
+const rawNavigationApi = inBrowser
 	? (window as Window & { navigation?: NavigationApi }).navigation
 	: undefined;
+const supportsNavigationPrecommit =
+	inBrowser &&
+	typeof (window as Window & { NavigationPrecommitController?: unknown })
+		.NavigationPrecommitController === 'function';
+const navigationApi = supportsNavigationPrecommit ? rawNavigationApi : undefined;
 
 export const supportsViewTransitions = inBrowser && !!document.startViewTransition;
 export const supportsNavigationApi = !!navigationApi;
@@ -98,7 +134,8 @@ let parser: DOMParser;
 let currentHistoryIndex = 0;
 let bypassNavigationApi = false;
 const navigationScrollPositions = new Map<string, { scrollX: number; scrollY: number }>();
-let navigationInProgress: NavigateEvent | undefined;
+const navigationEntries = new Map<string, NavigationHistoryEntry>();
+const astroNavigationRequests = new WeakMap<object, AstroNavigationRequest>();
 
 if (inBrowser && !supportsNavigationApi) {
 	if (history.state) {
@@ -114,11 +151,41 @@ if (inBrowser && !supportsNavigationApi) {
 	}
 }
 
+function trackNavigationEntry(entry = navigationApi?.currentEntry) {
+	if (!entry || navigationEntries.get(entry.key) === entry) return;
+	navigationEntries.set(entry.key, entry);
+	entry.addEventListener(
+		'dispose',
+		() => {
+			if (navigationEntries.get(entry.key) !== entry) return;
+			navigationEntries.delete(entry.key);
+			navigationScrollPositions.delete(entry.key);
+		},
+		{ once: true },
+	);
+}
+
+function saveNavigationScrollPosition() {
+	const entry = navigationApi?.currentEntry;
+	if (entry && navigationEntries.has(entry.key)) {
+		navigationScrollPositions.set(entry.key, { scrollX, scrollY });
+	}
+}
+
+function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {
+	const currentEntry = navigationApi?.currentEntry;
+	if (
+		currentEntry &&
+		!navigationEntries.has(currentEntry.key) &&
+		navigationEntries.has(event.from.key) &&
+		currentEntry.sameDocument
+	) {
+		trackNavigationEntry(currentEntry);
+	}
+}
+
 // returns the contents of the page or null if the router can't deal with it.
-async function fetchHTML(
-	href: string,
-	init?: RequestInit,
-): Promise<null | FetchedHTML> {
+async function fetchHTML(href: string, init?: RequestInit): Promise<null | FetchedHTML> {
 	try {
 		// Apply adapter-specific headers for internal fetches
 		const headers = new Headers(init?.headers);
@@ -354,6 +421,13 @@ async function updateDOM(
 				navigationEvent.scroll();
 			}
 		} else {
+			// Navigation API state and classic history.state are separate. Keep the public
+			// navigate({ state }) behavior visible through both APIs.
+			if (options.state !== undefined) {
+				history.replaceState(options.state, '');
+				navigationApi?.updateCurrentEntry({ state: options.state });
+			}
+			trackNavigationEntry();
 			navigationEvent.scroll();
 		}
 	} else {
@@ -378,6 +452,83 @@ function abortAndRecreateMostRecentNavigation(): Navigation {
 	});
 }
 
+async function defaultLoader(preparationEvent: TransitionBeforePreparationEvent, from: URL) {
+	const href = preparationEvent.to.href;
+	const init: RequestInit = { signal: preparationEvent.signal };
+	if (preparationEvent.formData) {
+		init.method = 'POST';
+		const form =
+			preparationEvent.sourceElement instanceof HTMLFormElement
+				? preparationEvent.sourceElement
+				: preparationEvent.sourceElement instanceof HTMLElement &&
+						'form' in preparationEvent.sourceElement
+					? (preparationEvent.sourceElement.form as HTMLFormElement)
+					: preparationEvent.sourceElement?.closest('form');
+		// Form elements without enctype explicitly set default to application/x-www-form-urlencoded.
+		// In order to maintain compatibility with Astro 4.x, we need to check the value of enctype
+		// on the attributes property rather than accessing .enctype directly. Astro 5.x may
+		// introduce defaulting to application/x-www-form-urlencoded as a breaking change, and then
+		// we can access .enctype directly.
+		//
+		// Note: getNamedItem can return null in real life, even if TypeScript doesn't think so, hence
+		// the ?.
+		init.body =
+			from !== undefined &&
+			Reflect.get(HTMLFormElement.prototype, 'attributes', form).getNamedItem('enctype')?.value ===
+				'application/x-www-form-urlencoded'
+				? new URLSearchParams(preparationEvent.formData as any)
+				: preparationEvent.formData;
+	}
+	const response = await fetchHTML(href, init);
+	// If there is a problem fetching the new page, just do an MPA navigation to it.
+	if (response === null) {
+		preparationEvent.preventDefault();
+		return;
+	}
+	// if there was a redirection, show the final URL in the browser's address bar
+	if (response.redirected) {
+		const redirectedTo = new URL(response.redirected);
+		// but do not redirect cross origin
+		if (redirectedTo.origin !== preparationEvent.to.origin) {
+			preparationEvent.preventDefault();
+			return;
+		}
+		// preserve fragment
+		const fragment = preparationEvent.to.hash;
+		preparationEvent.to = redirectedTo;
+		preparationEvent.to.hash = fragment;
+	}
+
+	parser ??= new DOMParser();
+
+	preparationEvent.newDocument = parser.parseFromString(response.html, response.mediaType);
+	// The next line might look like a hack,
+	// but it is actually necessary as noscript elements
+	// and their contents are returned as markup by the parser,
+	// see https://developer.mozilla.org/en-US/docs/Web/API/DOMParser/parseFromString
+	preparationEvent.newDocument.querySelectorAll('noscript').forEach((el) => el.remove());
+
+	// If ClientRouter is not enabled on the incoming page, do a full page load to it.
+	// Unless this was a form submission, in which case we do not want to trigger another mutation.
+	if (
+		!preparationEvent.newDocument.querySelector('[name="astro-view-transitions-enabled"]') &&
+		!preparationEvent.formData
+	) {
+		preparationEvent.preventDefault();
+		return;
+	}
+
+	const links = preloadStyleLinks(preparationEvent.newDocument);
+	links.length && !preparationEvent.signal.aborted && (await Promise.all(links));
+
+	if (import.meta.env.DEV && !preparationEvent.signal.aborted)
+		await prepareForClientOnlyComponents(
+			preparationEvent.newDocument,
+			preparationEvent.to,
+			preparationEvent.signal,
+		);
+}
+
 async function transition(
 	direction: Direction,
 	from: URL,
@@ -387,7 +538,7 @@ async function transition(
 	hasUAVisualTransition = false,
 	navigationTypeOverride?: NavigationTypeString,
 	navigationEvent?: NavigateEvent,
-	preloadedResponse?: FetchedHTML,
+	preparedEvent?: TransitionBeforePreparationEvent,
 ) {
 	// The most recent navigation always has precedence
 	// Yes, there can be several navigation instances as the user can click links
@@ -415,7 +566,7 @@ async function transition(
 	if (!navigationEvent && navigationType !== 'traverse') {
 		updateScrollPosition({ scrollX, scrollY });
 	}
-	if (samePage(from, to) && !options.formData) {
+	if (!navigationEvent && samePage(from, to) && !options.formData) {
 		if ((direction !== 'back' && to.hash) || (direction === 'back' && from.hash)) {
 			moveToLocation(to, from, options, document.title, historyState);
 			if (currentNavigation === mostRecentNavigation) mostRecentNavigation = undefined;
@@ -423,18 +574,20 @@ async function transition(
 		}
 	}
 
-	const prepEvent = await doPreparation(
-		from,
-		to,
-		direction,
-		navigationType,
-		options.sourceElement,
-		options.info,
-		currentNavigation!.controller.signal,
-		options.formData,
-		defaultLoader,
-		!navigationEvent,
-	);
+	const prepEvent =
+		preparedEvent ??
+		(await doPreparation(
+			from,
+			to,
+			direction,
+			navigationType,
+			options.sourceElement,
+			options.info,
+			currentNavigation!.controller.signal,
+			options.formData,
+			(event) => defaultLoader(event, from),
+			!navigationEvent,
+		));
 	if (prepEvent.defaultPrevented || prepEvent.signal.aborted) {
 		if (currentNavigation === mostRecentNavigation) mostRecentNavigation = undefined;
 		if (!prepEvent.signal.aborted) {
@@ -446,83 +599,6 @@ async function transition(
 		return;
 	}
 
-	async function defaultLoader(preparationEvent: TransitionBeforePreparationEvent) {
-		const href = preparationEvent.to.href;
-		const init: RequestInit = { signal: preparationEvent.signal };
-		if (preparationEvent.formData) {
-			init.method = 'POST';
-			const form =
-				preparationEvent.sourceElement instanceof HTMLFormElement
-					? preparationEvent.sourceElement
-					: preparationEvent.sourceElement instanceof HTMLElement &&
-							'form' in preparationEvent.sourceElement
-						? (preparationEvent.sourceElement.form as HTMLFormElement)
-						: preparationEvent.sourceElement?.closest('form');
-			// Form elements without enctype explicitly set default to application/x-www-form-urlencoded.
-			// In order to maintain compatibility with Astro 4.x, we need to check the value of enctype
-			// on the attributes property rather than accessing .enctype directly. Astro 5.x may
-			// introduce defaulting to application/x-www-form-urlencoded as a breaking change, and then
-			// we can access .enctype directly.
-			//
-			// Note: getNamedItem can return null in real life, even if TypeScript doesn't think so, hence
-			// the ?.
-			init.body =
-				from !== undefined &&
-				Reflect.get(HTMLFormElement.prototype, 'attributes', form).getNamedItem('enctype')
-					?.value === 'application/x-www-form-urlencoded'
-					? new URLSearchParams(preparationEvent.formData as any)
-					: preparationEvent.formData;
-		}
-		const response = preloadedResponse ?? (await fetchHTML(href, init));
-		preloadedResponse = undefined;
-		// If there is a problem fetching the new page, just do an MPA navigation to it.
-		if (response === null) {
-			preparationEvent.preventDefault();
-			return;
-		}
-		// if there was a redirection, show the final URL in the browser's address bar
-		if (response.redirected) {
-			const redirectedTo = new URL(response.redirected);
-			// but do not redirect cross origin
-			if (redirectedTo.origin !== preparationEvent.to.origin) {
-				preparationEvent.preventDefault();
-				return;
-			}
-			// preserve fragment
-			const fragment = preparationEvent.to.hash;
-			preparationEvent.to = redirectedTo;
-			preparationEvent.to.hash = fragment;
-		}
-
-		parser ??= new DOMParser();
-
-		preparationEvent.newDocument = parser.parseFromString(response.html, response.mediaType);
-		// The next line might look like a hack,
-		// but it is actually necessary as noscript elements
-		// and their contents are returned as markup by the parser,
-		// see https://developer.mozilla.org/en-US/docs/Web/API/DOMParser/parseFromString
-		preparationEvent.newDocument.querySelectorAll('noscript').forEach((el) => el.remove());
-
-		// If ClientRouter is not enabled on the incoming page, do a full page load to it.
-		// Unless this was a form submission, in which case we do not want to trigger another mutation.
-		if (
-			!preparationEvent.newDocument.querySelector('[name="astro-view-transitions-enabled"]') &&
-			!preparationEvent.formData
-		) {
-			preparationEvent.preventDefault();
-			return;
-		}
-
-		const links = preloadStyleLinks(preparationEvent.newDocument);
-		links.length && !preparationEvent.signal.aborted && (await Promise.all(links));
-
-		if (import.meta.env.DEV && !preparationEvent.signal.aborted)
-			await prepareForClientOnlyComponents(
-				preparationEvent.newDocument,
-				preparationEvent.to,
-				preparationEvent.signal,
-			);
-	}
 	async function abortAndRecreateMostRecentTransition(): Promise<Transition> {
 		if (mostRecentTransition) {
 			if (mostRecentTransition.viewTransition) {
@@ -658,10 +734,26 @@ export async function navigate(href: string, options?: Options) {
 		return;
 	}
 	if (navigationApi) {
-		navigationApi.navigate(new URL(href, location.href).href, {
-			history: options?.history ?? 'auto',
-			info: options ?? {},
+		const to = new URL(href, location.href);
+		const request: AstroNavigationRequest = { intercepted: false, options: options ?? {} };
+		const info = {};
+		astroNavigationRequests.set(info, request);
+		const result = navigationApi.navigate(to.href, {
+			history: request.options.history ?? 'auto',
+			info,
+			state: request.options.state,
 		});
+		// The navigate event is dispatched synchronously. If Astro did not intercept it,
+		// the browser owns the navigation and cross-document promises may never settle.
+		if (!request.intercepted) return;
+		try {
+			await result.finished;
+		} catch (error) {
+			// Superseded navigations and navigations delegated back to the browser abort the
+			// intercepted navigation. The History API implementation did not surface that abort.
+			if (error instanceof DOMException && error.name === 'AbortError') return;
+			throw error;
+		}
 		return;
 	}
 	await transition('forward', originalLocation, new URL(href, location.href), options ?? {});
@@ -672,8 +764,15 @@ function onNavigate(event: NavigateEvent) {
 		bypassNavigationApi = false;
 		return;
 	}
+	if (!transitionEnabledOnThisPage()) return;
+
 	const navigationType = event.navigationType;
-	const options = (event.info as Options | undefined) ?? {};
+	const request =
+		typeof event.info === 'object' && event.info !== null
+			? astroNavigationRequests.get(event.info)
+			: undefined;
+	const isAstroNavigation = request !== undefined;
+	const options = request?.options ?? {};
 	const formData = event.formData ?? options.formData;
 	const currentEntry = navigationApi?.currentEntry;
 	const from = new URL(currentEntry?.url ?? location.href);
@@ -686,9 +785,19 @@ function onNavigate(event: NavigateEvent) {
 		!formData &&
 		event.hashChange &&
 		((direction !== 'back' && !!to.hash) || (direction === 'back' && !!from.hash));
+	const needsPrecommit = navigationType === 'push' || navigationType === 'replace';
+	const managedTraverse =
+		navigationType !== 'traverse' ||
+		(!!currentEntry &&
+			navigationEntries.has(currentEntry.key) &&
+			navigationEntries.has(event.destination.key));
+
+	saveNavigationScrollPosition();
 
 	if (
-		((navigationType === 'push' || navigationType === 'replace') && event.info === undefined) ||
+		(needsPrecommit && !isAstroNavigation) ||
+		(needsPrecommit && !event.cancelable) ||
+		(navigationType === 'traverse' && (!event.destination.sameDocument || !managedTraverse)) ||
 		!event.canIntercept ||
 		browserHandlesHashChange ||
 		location.origin !== to.origin ||
@@ -697,56 +806,65 @@ function onNavigate(event: NavigateEvent) {
 		return;
 	}
 
-	let preloadedResponse: FetchedHTML | undefined;
+	let preparedEvent: TransitionBeforePreparationEvent | undefined;
 	event.intercept({
 		focusReset: 'manual',
-		precommitHandler:
-			(navigationType === 'push' || navigationType === 'replace') && !formData
-				? async () => {
-					const response = await fetchHTML(to.href, { signal: event.signal });
-					if (response) {
-						parser ??= new DOMParser();
-						const nextDocument = parser.parseFromString(response.html, response.mediaType);
-						if (nextDocument.querySelector('[name="astro-view-transitions-enabled"]')) {
-							preloadedResponse = response;
-							return;
-						}
+		precommitHandler: needsPrecommit
+			? async (controller) => {
+					preparedEvent = await doPreparation(
+						from,
+						to,
+						direction,
+						navigationType,
+						options.sourceElement ?? event.sourceElement,
+						options.info,
+						event.signal,
+						formData,
+						(preparationEvent) => defaultLoader(preparationEvent, from),
+						false,
+					);
+					if (event.signal.aborted) {
+						throw event.signal.reason ?? new DOMException('Navigation aborted', 'AbortError');
 					}
-					bypassNavigationApi = true;
-					location.href = to.href;
-					throw new DOMException('Delegating navigation to the browser', 'AbortError');
+					if (preparedEvent.defaultPrevented) {
+						bypassNavigationApi = true;
+						location.href = to.href;
+						throw new DOMException('Delegating navigation to the browser', 'AbortError');
+					}
+					if (preparedEvent.to.origin !== location.origin) {
+						bypassNavigationApi = true;
+						location.href = preparedEvent.to.href;
+						throw new DOMException('Delegating navigation to the browser', 'AbortError');
+					}
+					if (preparedEvent.to.href !== to.href) {
+						controller.redirect(preparedEvent.to.href, {
+							history: options.history ?? 'auto',
+							info: event.info,
+							state: options.state,
+						});
+					}
 				}
-				: undefined,
+			: undefined,
 		scroll: 'manual',
 		handler: async () => {
-			navigationInProgress = event;
-			try {
-				await transition(
-					direction,
-					from,
-					to,
-					{
-						...options,
-						sourceElement: event.sourceElement ?? options.sourceElement,
-						formData: event.formData ?? options.formData,
-					},
-					undefined,
-					event.hasUAVisualTransition ?? false,
-					navigationType,
-					event,
-					preloadedResponse,
-				);
-			} finally {
-				if (navigationInProgress === event) navigationInProgress = undefined;
-			}
+			await transition(
+				direction,
+				from,
+				preparedEvent?.to ?? new URL(event.destination.url),
+				{
+					...options,
+					sourceElement: options.sourceElement ?? event.sourceElement,
+					formData,
+				},
+				undefined,
+				event.hasUAVisualTransition ?? false,
+				navigationType,
+				event,
+				preparedEvent,
+			);
 		},
 	});
-}
-
-function onNavigationScroll() {
-	if (navigationInProgress) return;
-	const entry = navigationApi?.currentEntry;
-	if (entry) navigationScrollPositions.set(entry.key, { scrollX, scrollY });
+	if (request) request.intercepted = true;
 }
 
 function onPopState(ev: PopStateEvent) {
@@ -795,10 +913,14 @@ const onScrollEnd = () => {
 if (inBrowser) {
 	if (supportsViewTransitions || getFallback() !== 'none') {
 		originalLocation = new URL(location.href);
-		if (navigationApi) navigationApi.addEventListener('navigate', onNavigate);
-		else addEventListener('popstate', onPopState);
+		if (navigationApi) {
+			if (transitionEnabledOnThisPage()) trackNavigationEntry();
+			navigationApi.addEventListener('navigate', onNavigate);
+			navigationApi.addEventListener('currententrychange', onNavigationCurrentEntryChange);
+		} else {
+			addEventListener('popstate', onPopState);
+		}
 		addEventListener('load', onPageLoad);
-		if (navigationApi) addEventListener('scroll', onNavigationScroll, { passive: true });
 		// There's not a good way to record scroll position before a history back
 		// navigation, so we will record it when the user has stopped scrolling.
 		if (!navigationApi && 'onscrollend' in window) addEventListener('scrollend', onScrollEnd);
