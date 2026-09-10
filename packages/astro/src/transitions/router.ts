@@ -13,6 +13,7 @@ type State = {
 type Navigation = { controller: AbortController };
 type FetchedHTML = { html: string; redirected?: string; mediaType: DOMParserSupportedType };
 type NavigationHistoryEntry = {
+	id: string;
 	addEventListener: (type: 'dispose', listener: () => void, options?: { once?: boolean }) => void;
 	getState: () => unknown;
 	index: number;
@@ -45,7 +46,7 @@ type NavigationApi = {
 type NavigateEvent = {
 	canIntercept: boolean;
 	cancelable: boolean;
-	destination: { index: number; key: string; sameDocument: boolean; url: string };
+	destination: { id: string; index: number; key: string; sameDocument: boolean; url: string };
 	formData?: FormData;
 	hasUAVisualTransition?: boolean;
 	hashChange: boolean;
@@ -135,6 +136,7 @@ let currentHistoryIndex = 0;
 let bypassNavigationApi = false;
 const navigationScrollPositions = new Map<string, { scrollX: number; scrollY: number }>();
 const navigationEntries = new Map<string, NavigationHistoryEntry>();
+let pendingManagedHashEntry = false;
 const astroNavigationRequests = new WeakMap<object, AstroNavigationRequest>();
 
 if (inBrowser && !supportsNavigationApi) {
@@ -152,13 +154,13 @@ if (inBrowser && !supportsNavigationApi) {
 }
 
 function trackNavigationEntry(entry = navigationApi?.currentEntry) {
-	if (!entry || navigationEntries.get(entry.key) === entry) return;
-	navigationEntries.set(entry.key, entry);
+	if (!entry || navigationEntries.get(entry.id) === entry) return;
+	navigationEntries.set(entry.id, entry);
 	entry.addEventListener(
 		'dispose',
 		() => {
-			if (navigationEntries.get(entry.key) !== entry) return;
-			navigationEntries.delete(entry.key);
+			if (navigationEntries.get(entry.id) !== entry) return;
+			navigationEntries.delete(entry.id);
 			navigationScrollPositions.delete(entry.key);
 		},
 		{ once: true },
@@ -167,7 +169,7 @@ function trackNavigationEntry(entry = navigationApi?.currentEntry) {
 
 function saveNavigationScrollPosition() {
 	const entry = navigationApi?.currentEntry;
-	if (entry && navigationEntries.has(entry.key)) {
+	if (entry && navigationEntries.has(entry.id)) {
 		navigationScrollPositions.set(entry.key, { scrollX, scrollY });
 	}
 }
@@ -175,13 +177,13 @@ function saveNavigationScrollPosition() {
 function onNavigationCurrentEntryChange(event: NavigationCurrentEntryChangeEvent) {
 	const currentEntry = navigationApi?.currentEntry;
 	if (
-		currentEntry &&
-		!navigationEntries.has(currentEntry.key) &&
-		navigationEntries.has(event.from.key) &&
-		currentEntry.sameDocument
+		pendingManagedHashEntry &&
+		currentEntry?.sameDocument &&
+		navigationEntries.has(event.from.id)
 	) {
 		trackNavigationEntry(currentEntry);
 	}
+	pendingManagedHashEntry = false;
 }
 
 // returns the contents of the page or null if the router can't deal with it.
@@ -789,9 +791,14 @@ function onNavigate(event: NavigateEvent) {
 	const managedTraverse =
 		navigationType !== 'traverse' ||
 		(!!currentEntry &&
-			navigationEntries.has(currentEntry.key) &&
-			navigationEntries.has(event.destination.key));
+			navigationEntries.has(currentEntry.id) &&
+			navigationEntries.has(event.destination.id));
 
+	pendingManagedHashEntry =
+		browserHandlesHashChange &&
+		isAstroNavigation &&
+		!!currentEntry &&
+		navigationEntries.has(currentEntry.id);
 	saveNavigationScrollPosition();
 
 	if (
