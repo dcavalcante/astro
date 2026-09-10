@@ -14,11 +14,18 @@ test.afterAll(async () => {
 	await devServer.stop();
 });
 
-test('does not claim same-document entries owned by another Navigation API router', async ({
-	page,
-	astro,
-}) => {
-	await page.goto(astro.resolveUrl('/one'));
+async function installExternalRouter(page: import('@playwright/test').Page) {
+	await page.evaluate(() => {
+		const navigation = (window as Window & { navigation: any }).navigation;
+		navigation.addEventListener('navigate', (event: any) => {
+			if (event.info?.externalRouter === true || event.navigationType === 'traverse') {
+				event.intercept({ handler: async () => {} });
+			}
+		});
+	});
+}
+
+async function expectNavigationApi(page: import('@playwright/test').Page) {
 	const supported = await page.evaluate(
 		() =>
 			typeof (window as Window & { navigation?: unknown }).navigation === 'object' &&
@@ -26,19 +33,29 @@ test('does not claim same-document entries owned by another Navigation API route
 				.NavigationPrecommitController === 'function',
 	);
 	if (!supported) test.skip();
+}
 
+async function startPreparationCounter(page: import('@playwright/test').Page) {
 	await page.evaluate(() => {
-		const navigation = (window as Window & { navigation: any }).navigation;
-		navigation.addEventListener('navigate', (event: any) => {
-			const destination = new URL(event.destination.url);
-			if (
-				destination.pathname === '/one' &&
-				(event.info?.externalRouter === true || event.navigationType === 'traverse')
-			) {
-				event.intercept({ handler: async () => {} });
-			}
+		(window as Window & { astroPreparations?: number }).astroPreparations = 0;
+		document.addEventListener('astro:before-preparation', () => {
+			(window as Window & { astroPreparations?: number }).astroPreparations!++;
 		});
 	});
+}
+
+async function expectNoAstroPreparation(page: import('@playwright/test').Page) {
+	expect(
+		await page.evaluate(
+			() => (window as Window & { astroPreparations?: number }).astroPreparations,
+		),
+	).toBe(0);
+}
+
+test('does not claim pushed entries owned by another Navigation API router', async ({ page, astro }) => {
+	await page.goto(astro.resolveUrl('/one'));
+	await expectNavigationApi(page);
+	await installExternalRouter(page);
 
 	await page.evaluate(async () => {
 		const navigation = (window as Window & { navigation: any }).navigation;
@@ -48,21 +65,37 @@ test('does not claim same-document entries owned by another Navigation API route
 	});
 	await expect(page).toHaveURL(/\/one\?external-router=1$/);
 
-	await page.evaluate(() => {
-		(window as Window & { astroPreparations?: number }).astroPreparations = 0;
-		document.addEventListener('astro:before-preparation', () => {
-			(window as Window & { astroPreparations?: number }).astroPreparations!++;
-		});
-	});
-
+	await startPreparationCounter(page);
 	await page.evaluate(async () => {
 		const navigation = (window as Window & { navigation: any }).navigation;
 		await navigation.back().finished;
 	});
 	await expect(page).toHaveURL(/\/one$/);
-	expect(
-		await page.evaluate(
-			() => (window as Window & { astroPreparations?: number }).astroPreparations,
-		),
-	).toBe(0);
+	await expectNoAstroPreparation(page);
+});
+
+test('does not claim replaced entries owned by another Navigation API router', async ({ page, astro }) => {
+	await page.goto(astro.resolveUrl('/one'));
+	await expectNavigationApi(page);
+
+	await page.click('#click-two');
+	await expect(page.locator('#two')).toHaveText('Page 2');
+	await installExternalRouter(page);
+
+	await page.evaluate(async () => {
+		const navigation = (window as Window & { navigation: any }).navigation;
+		await navigation.navigate('/two?external-router=replace', {
+			history: 'replace',
+			info: { externalRouter: true },
+		}).finished;
+	});
+	await expect(page).toHaveURL(/\/two\?external-router=replace$/);
+
+	await startPreparationCounter(page);
+	await page.evaluate(async () => {
+		const navigation = (window as Window & { navigation: any }).navigation;
+		await navigation.back().finished;
+	});
+	await expect(page).toHaveURL(/\/one$/);
+	await expectNoAstroPreparation(page);
 });
