@@ -1,0 +1,17 @@
+name: Navigation API final formatting
+
+on:
+  push:
+    branches:
+      - review/navigation-api-client-router-static-final
+
+permissions:
+  contents: read
+
+jobs:
+  biome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: biomejs/setup-biome@4c91541eaada48f67d7dbd7833600ce162b68f51
+      - run: biome check packages/astro/src/transitions/router.ts packages/astro/src/transitions/events.ts packages/astro/e2e/view-transitions.test.ts packages/astro/e2e/navigation-api-interop.test.ts
