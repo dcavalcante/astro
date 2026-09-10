@@ -1,4 +1,4 @@
-name: Navigation API review v6
+name: Navigation API review v7
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   review:
-    if: github.event.head_commit.message == 'review navigation api v6'
+    if: github.event.head_commit.message == 'review navigation api v7'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -60,6 +60,20 @@ jobs:
           assert old in tests
           tests = tests.replace(old, new, 1)
           test_path.write_text(tests)
+
+          router_path = Path('packages/astro/src/transitions/router.ts')
+          router = router_path.read_text()
+          old_scroll = """\t\t\ttrackNavigationEntry();
+          \t\t\tnavigationEvent.scroll();"""
+          new_scroll = """\t\t\ttrackNavigationEntry();
+          \t\t\tif (swapEvent.to.hash) {
+          \t\t\t\tnavigationEvent.scroll();
+          \t\t\t} else {
+          \t\t\t\tscrollTo({ left: 0, top: 0, behavior: 'instant' });
+          \t\t\t}"""
+          assert old_scroll in router
+          router = router.replace(old_scroll, new_scroll, 1)
+          router_path.write_text(router)
           PY
           git diff --check
 
@@ -70,7 +84,7 @@ jobs:
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
           --project="Chrome Stable" --workers=1 --retries=0
-          --grep="No page rendering during swap|Back button is captured|cross-route fragments|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts|Use the client side router in framework components"
+          --grep="No page rendering during swap|push navigation starts the destination at the top|cross-route fragments|Back button is captured|Scroll position restored when transitioning back to fragment|Horizontal scroll position restored on back button|View Transitions Rule|Navigation API restores Astro-managed traversal|Navigation API reports traversal direction|Navigation API preserves navigate state|Navigation API runs custom preparation|ClientRouter does not claim external|ClientRouter does not intercept cross-document|falls back to History API when Navigation precommit|body inline scripts|Use the client side router in framework components"
 
       - name: Swap rendering stress
         run: >-
@@ -81,7 +95,7 @@ jobs:
       - name: Framework router stress
         run: >-
           pnpm -C packages/astro exec playwright test e2e/view-transitions.test.ts
-          --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=5
+          --project="Chrome Stable" --workers=1 --retries=0 --repeat-each=10
           --grep="Use the client side router in framework components"
 
       - name: Full View Transitions Chrome suite
